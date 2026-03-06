@@ -13,20 +13,22 @@ import {
   collection,
   doc,
   getDoc,
+  getDocs,
   onSnapshot,
   orderBy,
   query,
   setDoc,
-  limit
+  limit,
+  where
 } from 'firebase/firestore';
 import { getDownloadURL, ref, uploadString } from 'firebase/storage';
 import QRCode from 'qrcode';
 import toast, { Toaster } from 'react-hot-toast';
 import { format } from 'date-fns';
 import { auth, db, storage } from './lib/firebase';
-import { enqueue } from './lib/offlineQueue';
+import { cacheBranches, cacheProfile, clearCachedProfile, enqueue, getCachedBranches, getCachedProfile } from './lib/offlineQueue';
 import { useSyncEngine } from './hooks/useSyncEngine';
-import type { Role, UserProfile } from './types/models';
+import type { Branch, Role, UserProfile } from './types/models';
 
 const companyCode = (import.meta.env.VITE_COMPANY_CODE || 'DRS') as 'DRS' | 'BIG5';
 
@@ -39,6 +41,65 @@ type Checkpoint = { id: string; name: string; lat: number; lng: number };
 
 type Activity = { id: string; type: string; createdAt: string; summary: string };
 
+type RolePermissions = {
+  canPatrol: boolean;
+  canIncident: boolean;
+  canAttendance: boolean;
+  canPanic: boolean;
+  canManageSystem: boolean;
+  canMonitor: boolean;
+  canExport: boolean;
+};
+
+const rolePermissions: Record<Role, RolePermissions> = {
+  guard: {
+    canPatrol: true,
+    canIncident: true,
+    canAttendance: true,
+    canPanic: true,
+    canManageSystem: false,
+    canMonitor: false,
+    canExport: false
+  },
+  admin: {
+    canPatrol: false,
+    canIncident: false,
+    canAttendance: false,
+    canPanic: false,
+    canManageSystem: true,
+    canMonitor: true,
+    canExport: true
+  },
+  management: {
+    canPatrol: false,
+    canIncident: false,
+    canAttendance: false,
+    canPanic: false,
+    canManageSystem: false,
+    canMonitor: true,
+    canExport: true
+  },
+  owner: {
+    canPatrol: true,
+    canIncident: true,
+    canAttendance: true,
+    canPanic: true,
+    canManageSystem: true,
+    canMonitor: true,
+    canExport: true
+  }
+};
+
+const fallbackBranches: Branch[] = companyCode === 'DRS'
+  ? [
+      { id: 'drs-jhb-central', companyCode: 'DRS', name: 'Johannesburg Central', code: 'JHB-CENTRAL', active: true, createdAt: new Date().toISOString() },
+      { id: 'drs-pta-east', companyCode: 'DRS', name: 'Pretoria East', code: 'PTA-EAST', active: true, createdAt: new Date().toISOString() }
+    ]
+  : [
+      { id: 'big5-jhb-north', companyCode: 'BIG5', name: 'Johannesburg North', code: 'JHB-NORTH', active: true, createdAt: new Date().toISOString() },
+      { id: 'big5-randburg', companyCode: 'BIG5', name: 'Randburg', code: 'RANDBURG', active: true, createdAt: new Date().toISOString() }
+    ];
+
 function App() {
   const online = useSyncEngine();
   const [user, setUser] = useState<User | null>(null);
@@ -49,14 +110,24 @@ function App() {
     return onAuthStateChanged(auth, async (authUser) => {
       setUser(authUser);
       if (!authUser) {
+        if (user?.uid) {
+          await clearCachedProfile(user.uid);
+        }
         setProfile(null);
         setLoading(false);
         return;
       }
-      const profileRef = doc(db, 'users', authUser.uid);
-      const profileSnap = await getDoc(profileRef);
-      if (profileSnap.exists()) {
-        setProfile(profileSnap.data() as UserProfile);
+      try {
+        const profileSnap = await getDoc(doc(db, 'users', authUser.uid));
+        if (profileSnap.exists()) {
+          const loaded = profileSnap.data() as UserProfile;
+          setProfile(loaded);
+          await cacheProfile(loaded);
+        } else {
+          setProfile(await getCachedProfile(authUser.uid));
+        }
+      } catch {
+        setProfile(await getCachedProfile(authUser.uid));
       }
       setLoading(false);
     });
@@ -70,7 +141,7 @@ function App() {
     return <LoginScreen online={online} />;
   }
 
-  if (!profile) {
+  if (!profile || !profile.onboardingCompleted) {
     return <RoleOnboarding user={user} onDone={setProfile} />;
   }
 
@@ -108,31 +179,89 @@ function LoginScreen({ online }: { online: boolean }) {
 
 function RoleOnboarding({ user, onDone }: { user: User; onDone: (profile: UserProfile) => void }) {
   const [role, setRole] = useState<Role>('guard');
+  const [branches, setBranches] = useState<Branch[]>(fallbackBranches);
+  const [branchId, setBranchId] = useState(fallbackBranches[0]?.id || '');
+
+  useEffect(() => {
+    let mounted = true;
+    const loadBranches = async () => {
+      try {
+        const snap = await getDocs(query(collection(db, `${companyCode}_branches`), where('active', '==', true), limit(100)));
+        if (snap.size > 0) {
+          const live = snap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<Branch, 'id'>) }));
+          if (!mounted) return;
+          setBranches(live);
+          setBranchId(live[0]?.id || '');
+          await cacheBranches(live);
+          return;
+        }
+      } catch {
+        // load from IndexedDB fallback below
+      }
+      const cached = await getCachedBranches();
+      if (mounted && cached.length) {
+        setBranches(cached);
+        setBranchId(cached[0]?.id || '');
+      }
+    };
+    loadBranches();
+    return () => {
+      mounted = false;
+    };
+  }, []);
 
   const save = async () => {
+    const selected = branches.find((b) => b.id === branchId);
+    if (role !== 'owner' && !selected) {
+      toast.error('Select a branch to continue.');
+      return;
+    }
+
     const profile: UserProfile = {
       uid: user.uid,
       email: user.email || '',
       displayName: user.displayName || 'Unknown User',
       role,
       companyCode,
+      branchId: role === 'owner' ? 'ALL' : selected!.id,
+      branchName: role === 'owner' ? 'All Branches' : selected!.name,
+      onboardingCompleted: true,
       createdAt: new Date().toISOString()
     };
-    await setDoc(doc(db, 'users', user.uid), profile, { merge: true });
-    await addDoc(collection(db, 'auditLogs'), {
-      action: 'ROLE_SELECTED',
-      uid: user.uid,
-      role,
-      companyCode,
-      createdAt: new Date().toISOString()
-    });
+    try {
+      await setDoc(doc(db, 'users', user.uid), profile, { merge: true });
+      await addDoc(collection(db, 'auditLogs'), {
+        action: 'ROLE_BRANCH_SELECTED',
+        uid: user.uid,
+        role,
+        companyCode,
+        branchId: profile.branchId,
+        createdAt: new Date().toISOString()
+      });
+    } catch {
+      await enqueue({ type: 'profile', payload: { ...profile }, createdAt: new Date().toISOString() });
+      await enqueue({
+        type: 'audit',
+        payload: {
+          action: 'QUEUE_ROLE_BRANCH_SELECTED',
+          uid: user.uid,
+          role,
+          companyCode,
+          branchId: profile.branchId,
+          createdAt: new Date().toISOString()
+        },
+        createdAt: new Date().toISOString()
+      });
+    }
+    await cacheProfile(profile);
     onDone(profile);
   };
 
   return (
     <div className="min-h-screen p-6 grid place-items-center">
       <div className="w-full max-w-md bg-black/60 border border-white/10 rounded-2xl p-6 space-y-4">
-        <h2 className="text-xl font-semibold">Select your role</h2>
+        <h2 className="text-xl font-semibold">First Login Setup</h2>
+        <p className="text-sm text-white/75">Select role and branch assignment.</p>
         <select
           value={role}
           onChange={(e) => setRole(e.target.value as Role)}
@@ -143,6 +272,17 @@ function RoleOnboarding({ user, onDone }: { user: User; onDone: (profile: UserPr
           <option value="management">Management</option>
           <option value="owner">Owner</option>
         </select>
+        {role !== 'owner' && (
+          <select
+            value={branchId}
+            onChange={(e) => setBranchId(e.target.value)}
+            className="w-full p-3 rounded-lg bg-black border border-white/20"
+          >
+            {branches.map((branch) => (
+              <option key={branch.id} value={branch.id}>{branch.name}</option>
+            ))}
+          </select>
+        )}
         <button
           onClick={save}
           className="w-full py-3 rounded-xl font-semibold text-black"
@@ -160,9 +300,12 @@ function AuthedApp({ profile, online }: { profile: UserProfile; online: boolean 
   const location = useLocation();
   const [activities, setActivities] = useState<Activity[]>([]);
   const [checkpoints, setCheckpoints] = useState<Checkpoint[]>([]);
+  const [branches, setBranches] = useState<Branch[]>(fallbackBranches);
+  const [activeBranchId, setActiveBranchId] = useState(profile.branchId || 'ALL');
+  const permissions = rolePermissions[profile.role];
 
   useEffect(() => {
-    const q = query(collection(db, `${companyCode}_activity`), orderBy('createdAt', 'desc'), limit(8));
+    const q = scopedQuery(`${companyCode}_activity`, profile, activeBranchId, [orderBy('createdAt', 'desc'), limit(12)]);
     const unsub = onSnapshot(q, (snap) => {
       setActivities(
         snap.docs.map((d) => {
@@ -172,12 +315,23 @@ function AuthedApp({ profile, online }: { profile: UserProfile; online: boolean 
       );
     });
     return () => unsub();
-  }, []);
+  }, [profile, activeBranchId]);
 
   useEffect(() => {
-    const q = query(collection(db, `${companyCode}_checkpoints`));
+    const q = scopedQuery(`${companyCode}_checkpoints`, profile, activeBranchId, [limit(300)]);
     const unsub = onSnapshot(q, (snap) => {
       setCheckpoints(snap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<Checkpoint, 'id'>) })));
+    });
+    return () => unsub();
+  }, [profile, activeBranchId]);
+
+  useEffect(() => {
+    const unsub = onSnapshot(query(collection(db, `${companyCode}_branches`), where('active', '==', true), limit(200)), async (snap) => {
+      if (snap.size > 0) {
+        const live = snap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<Branch, 'id'>) }));
+        setBranches(live);
+        await cacheBranches(live);
+      }
     });
     return () => unsub();
   }, []);
@@ -186,26 +340,41 @@ function AuthedApp({ profile, online }: { profile: UserProfile; online: boolean 
     await signOut(auth);
   };
 
+  const activeBranchName = activeBranchId === 'ALL' ? 'All Branches' : branches.find((b) => b.id === activeBranchId)?.name || profile.branchName;
+
   const tabs = [
-    { path: '/home', label: 'Home' },
-    { path: '/patrol', label: 'Patrol' },
-    { path: '/incident', label: 'Incident' },
-    { path: '/attendance', label: 'Attendance' },
-    { path: '/panic', label: 'Panic' },
-    { path: '/tools', label: 'Tools' }
-  ];
+    { path: '/home', label: 'Home', show: true },
+    { path: '/patrol', label: 'Patrol', show: permissions.canPatrol || permissions.canMonitor },
+    { path: '/incident', label: 'Incident', show: permissions.canIncident || permissions.canMonitor },
+    { path: '/attendance', label: 'Attendance', show: permissions.canAttendance || permissions.canMonitor },
+    { path: '/panic', label: 'Panic', show: permissions.canPanic || permissions.canMonitor },
+    { path: '/tools', label: 'Tools', show: permissions.canManageSystem || permissions.canExport }
+  ].filter((tab) => tab.show);
 
   return (
-    <div className="min-h-screen pb-24 text-white">
+    <div className="min-h-[100dvh] pb-[calc(6rem+env(safe-area-inset-bottom))] text-white">
       <header className="sticky top-0 z-30 border-b border-white/10 bg-black/85 backdrop-blur px-4 py-3">
         <div className="flex justify-between items-center gap-3">
           <div>
             <p className="text-xs text-white/70">{branding.name}</p>
             <p className="font-semibold">{profile.displayName}</p>
             <p className="text-xs uppercase text-white/60">{profile.role}</p>
+            <p className="text-xs text-white/70">Branch: {activeBranchName}</p>
           </div>
-          <div className="text-right text-xs">
+          <div className="text-right text-xs space-y-1">
             <p>{online ? 'Online' : 'Offline'}</p>
+            {profile.role === 'owner' && (
+              <select
+                value={activeBranchId}
+                onChange={(e) => setActiveBranchId(e.target.value)}
+                className="bg-black border border-white/20 rounded p-1 text-[11px]"
+              >
+                <option value="ALL">All</option>
+                {branches.map((branch) => (
+                  <option key={branch.id} value={branch.id}>{branch.name}</option>
+                ))}
+              </select>
+            )}
             <button className="text-white/80 underline" onClick={logOut}>Sign out</button>
           </div>
         </div>
@@ -213,17 +382,17 @@ function AuthedApp({ profile, online }: { profile: UserProfile; online: boolean 
 
       <main className="p-4">
         <Routes>
-          <Route path="/home" element={<HomeView checkpoints={checkpoints} activities={activities} />} />
-          <Route path="/patrol" element={<PatrolView profile={profile} checkpoints={checkpoints} online={online} />} />
-          <Route path="/incident" element={<IncidentView profile={profile} online={online} />} />
-          <Route path="/attendance" element={<AttendanceView profile={profile} online={online} />} />
-          <Route path="/panic" element={<PanicView profile={profile} online={online} />} />
-          <Route path="/tools" element={<ToolsView profile={profile} checkpoints={checkpoints} />} />
+          <Route path="/home" element={<HomeView checkpoints={checkpoints} activities={activities} branchName={activeBranchName} />} />
+          <Route path="/patrol" element={<PatrolView profile={profile} checkpoints={checkpoints} online={online} activeBranchId={activeBranchId} activeBranchName={activeBranchName} permissions={permissions} />} />
+          <Route path="/incident" element={<IncidentView profile={profile} online={online} activeBranchId={activeBranchId} activeBranchName={activeBranchName} permissions={permissions} />} />
+          <Route path="/attendance" element={<AttendanceView profile={profile} online={online} activeBranchId={activeBranchId} activeBranchName={activeBranchName} permissions={permissions} />} />
+          <Route path="/panic" element={<PanicView profile={profile} online={online} activeBranchId={activeBranchId} activeBranchName={activeBranchName} permissions={permissions} />} />
+          <Route path="/tools" element={<ToolsView profile={profile} checkpoints={checkpoints} branches={branches} online={online} activeBranchId={activeBranchId} permissions={permissions} />} />
           <Route path="*" element={<Navigate to="/home" replace />} />
         </Routes>
       </main>
 
-      <nav className="fixed bottom-0 left-0 right-0 bg-black/95 border-t border-white/10 p-2 grid grid-cols-3 gap-2">
+      <nav className="fixed bottom-0 left-0 right-0 bg-black/95 border-t border-white/10 p-2 pb-[calc(.5rem+env(safe-area-inset-bottom))] grid grid-cols-3 gap-2">
         {tabs.map((tab) => (
           <button
             key={tab.path}
@@ -240,10 +409,10 @@ function AuthedApp({ profile, online }: { profile: UserProfile; online: boolean 
   );
 }
 
-function HomeView({ checkpoints, activities }: { checkpoints: Checkpoint[]; activities: Activity[] }) {
+function HomeView({ checkpoints, activities, branchName }: { checkpoints: Checkpoint[]; activities: Activity[]; branchName: string }) {
   return (
     <div className="space-y-4">
-      <Card title="Active Shift">Shift Active | Route A-4 | Next check: Gate North</Card>
+      <Card title="Active Shift">{`Branch: ${branchName} | Shift Active | Route Ready`}</Card>
       <Card title="Today Patrol Route">{checkpoints.length ? checkpoints.map((c) => c.name).join(' -> ') : 'No route assigned yet.'}</Card>
       <Card title="Recent Activity">
         <ul className="space-y-2 text-sm">
@@ -258,18 +427,41 @@ function HomeView({ checkpoints, activities }: { checkpoints: Checkpoint[]; acti
   );
 }
 
-function PatrolView({ profile, checkpoints, online }: { profile: UserProfile; checkpoints: Checkpoint[]; online: boolean }) {
+function PatrolView({
+  profile,
+  checkpoints,
+  online,
+  activeBranchId,
+  activeBranchName,
+  permissions
+}: {
+  profile: UserProfile;
+  checkpoints: Checkpoint[];
+  online: boolean;
+  activeBranchId: string;
+  activeBranchName: string;
+  permissions: RolePermissions;
+}) {
   const [checkpointId, setCheckpointId] = useState('');
   const [notes, setNotes] = useState('');
 
   const submit = async () => {
-    const gps = await getGps();
+    if (!permissions.canPatrol) {
+      toast.error('Role restriction: patrol submission not allowed.');
+      return;
+    }
+    if (activeBranchId === 'ALL') {
+      toast.error('Select a specific branch before submitting field data.');
+      return;
+    }
     const payload = {
       companyCode,
+      branchId: activeBranchId,
+      branchName: activeBranchName,
       guardUid: profile.uid,
       checkpointId,
       notes,
-      gps,
+      gps: await getGps(),
       createdAt: new Date().toISOString()
     };
     await submitWithOffline('patrol', payload, online);
@@ -279,6 +471,7 @@ function PatrolView({ profile, checkpoints, online }: { profile: UserProfile; ch
 
   return (
     <div className="space-y-4">
+      {!permissions.canPatrol && <ReadOnlyNotice text="Read-only patrol view: this role cannot submit patrol scans." />}
       <Card title="Patrol Checkpoint Scan">
         <label className="text-sm">Checkpoint ID / QR value</label>
         <input
@@ -286,10 +479,11 @@ function PatrolView({ profile, checkpoints, online }: { profile: UserProfile; ch
           onChange={(e) => setCheckpointId(e.target.value)}
           className="w-full mt-2 p-3 rounded-lg bg-black border border-white/20"
           placeholder="Scan or type checkpoint ID"
+          disabled={!permissions.canPatrol}
         />
         <div className="grid grid-cols-2 gap-2 mt-2 text-xs">
           {checkpoints.map((c) => (
-            <button key={c.id} className="bg-white/10 rounded p-2" onClick={() => setCheckpointId(c.id)}>{c.name}</button>
+            <button key={c.id} className="bg-white/10 rounded p-2 disabled:opacity-40" onClick={() => setCheckpointId(c.id)} disabled={!permissions.canPatrol}>{c.name}</button>
           ))}
         </div>
         <textarea
@@ -297,8 +491,9 @@ function PatrolView({ profile, checkpoints, online }: { profile: UserProfile; ch
           onChange={(e) => setNotes(e.target.value)}
           className="w-full mt-3 p-3 rounded-lg bg-black border border-white/20"
           placeholder="Optional notes"
+          disabled={!permissions.canPatrol}
         />
-        <button onClick={submit} className="w-full py-4 rounded-xl mt-3 text-black font-semibold" style={{ backgroundColor: branding.primary }}>
+        <button onClick={submit} className="w-full py-4 rounded-xl mt-3 text-black font-semibold disabled:opacity-40" style={{ backgroundColor: branding.primary }} disabled={!permissions.canPatrol}>
           Record Patrol Scan
         </button>
       </Card>
@@ -307,7 +502,19 @@ function PatrolView({ profile, checkpoints, online }: { profile: UserProfile; ch
   );
 }
 
-function IncidentView({ profile, online }: { profile: UserProfile; online: boolean }) {
+function IncidentView({
+  profile,
+  online,
+  activeBranchId,
+  activeBranchName,
+  permissions
+}: {
+  profile: UserProfile;
+  online: boolean;
+  activeBranchId: string;
+  activeBranchName: string;
+  permissions: RolePermissions;
+}) {
   const [type, setType] = useState('Suspicious activity');
   const [description, setDescription] = useState('');
   const [photoBase64, setPhotoBase64] = useState<string>('');
@@ -320,7 +527,15 @@ function IncidentView({ profile, online }: { profile: UserProfile; online: boole
   };
 
   const submit = async () => {
-    const gps = await getGps();
+    if (!permissions.canIncident) {
+      toast.error('Role restriction: incident submission not allowed.');
+      return;
+    }
+    if (activeBranchId === 'ALL') {
+      toast.error('Select a specific branch before submitting field data.');
+      return;
+    }
+
     let photoUrl = '';
     if (online && photoBase64) {
       const fileRef = ref(storage, `${companyCode}/incidents/${profile.uid}_${Date.now()}.jpg`);
@@ -330,10 +545,12 @@ function IncidentView({ profile, online }: { profile: UserProfile; online: boole
 
     const payload = {
       companyCode,
+      branchId: activeBranchId,
+      branchName: activeBranchName,
       guardUid: profile.uid,
       type,
       description,
-      gps,
+      gps: await getGps(),
       photoUrl,
       photoBase64: !online ? photoBase64 : '',
       createdAt: new Date().toISOString(),
@@ -348,8 +565,9 @@ function IncidentView({ profile, online }: { profile: UserProfile; online: boole
 
   return (
     <div className="space-y-4">
+      {!permissions.canIncident && <ReadOnlyNotice text="Read-only incident view: this role cannot submit incidents." />}
       <Card title="Incident Reporting">
-        <select value={type} onChange={(e) => setType(e.target.value)} className="w-full p-3 rounded-lg bg-black border border-white/20">
+        <select value={type} onChange={(e) => setType(e.target.value)} className="w-full p-3 rounded-lg bg-black border border-white/20" disabled={!permissions.canIncident}>
           <option>Suspicious activity</option>
           <option>Break-in</option>
           <option>Fire</option>
@@ -362,9 +580,10 @@ function IncidentView({ profile, online }: { profile: UserProfile; online: boole
           placeholder="Describe the incident"
           value={description}
           onChange={(e) => setDescription(e.target.value)}
+          disabled={!permissions.canIncident}
         />
-        <input className="w-full mt-3" type="file" accept="image/*" capture="environment" onChange={(e) => onFile(e.target.files?.[0])} />
-        <button onClick={submit} className="w-full py-4 rounded-xl mt-3 text-black font-semibold" style={{ backgroundColor: branding.primary }}>
+        <input className="w-full mt-3" type="file" accept="image/*" capture="environment" onChange={(e) => onFile(e.target.files?.[0])} disabled={!permissions.canIncident} />
+        <button onClick={submit} className="w-full py-4 rounded-xl mt-3 text-black font-semibold disabled:opacity-40" style={{ backgroundColor: branding.primary }} disabled={!permissions.canIncident}>
           Submit Incident
         </button>
       </Card>
@@ -373,10 +592,32 @@ function IncidentView({ profile, online }: { profile: UserProfile; online: boole
   );
 }
 
-function AttendanceView({ profile, online }: { profile: UserProfile; online: boolean }) {
+function AttendanceView({
+  profile,
+  online,
+  activeBranchId,
+  activeBranchName,
+  permissions
+}: {
+  profile: UserProfile;
+  online: boolean;
+  activeBranchId: string;
+  activeBranchName: string;
+  permissions: RolePermissions;
+}) {
   const punch = async (mode: 'IN' | 'OUT') => {
+    if (!permissions.canAttendance) {
+      toast.error('Role restriction: attendance clocking not allowed.');
+      return;
+    }
+    if (activeBranchId === 'ALL') {
+      toast.error('Select a specific branch before submitting field data.');
+      return;
+    }
     const payload = {
       companyCode,
+      branchId: activeBranchId,
+      branchName: activeBranchName,
       guardUid: profile.uid,
       guardName: profile.displayName,
       mode,
@@ -390,12 +631,13 @@ function AttendanceView({ profile, online }: { profile: UserProfile; online: boo
 
   return (
     <div className="space-y-4">
+      {!permissions.canAttendance && <ReadOnlyNotice text="Read-only attendance view: this role cannot clock in/out." />}
       <Card title="Attendance">
         <div className="grid grid-cols-2 gap-3">
-          <button className="py-6 rounded-xl text-lg font-bold text-black" style={{ backgroundColor: branding.primary }} onClick={() => punch('IN')}>
+          <button className="py-6 rounded-xl text-lg font-bold text-black disabled:opacity-40" style={{ backgroundColor: branding.primary }} onClick={() => punch('IN')} disabled={!permissions.canAttendance}>
             Clock In
           </button>
-          <button className="py-6 rounded-xl text-lg font-bold bg-white text-black" onClick={() => punch('OUT')}>
+          <button className="py-6 rounded-xl text-lg font-bold bg-white text-black disabled:opacity-40" onClick={() => punch('OUT')} disabled={!permissions.canAttendance}>
             Clock Out
           </button>
         </div>
@@ -404,10 +646,32 @@ function AttendanceView({ profile, online }: { profile: UserProfile; online: boo
   );
 }
 
-function PanicView({ profile, online }: { profile: UserProfile; online: boolean }) {
+function PanicView({
+  profile,
+  online,
+  activeBranchId,
+  activeBranchName,
+  permissions
+}: {
+  profile: UserProfile;
+  online: boolean;
+  activeBranchId: string;
+  activeBranchName: string;
+  permissions: RolePermissions;
+}) {
   const trigger = async () => {
+    if (!permissions.canPanic) {
+      toast.error('Role restriction: panic trigger not allowed.');
+      return;
+    }
+    if (activeBranchId === 'ALL') {
+      toast.error('Select a specific branch before submitting field data.');
+      return;
+    }
     const payload = {
       companyCode,
+      branchId: activeBranchId,
+      branchName: activeBranchName,
       guardUid: profile.uid,
       guardName: profile.displayName,
       gps: await getGps(),
@@ -420,20 +684,100 @@ function PanicView({ profile, online }: { profile: UserProfile; online: boolean 
 
   return (
     <div className="space-y-4">
+      {!permissions.canPanic && <ReadOnlyNotice text="Read-only panic view: this role cannot trigger panic alerts." />}
       <Card title="Emergency Panic Button">
-        <button onClick={trigger} className="w-full py-14 rounded-2xl bg-red-600 text-2xl font-black">PANIC</button>
+        <button onClick={trigger} className="w-full py-14 rounded-2xl bg-red-600 text-2xl font-black disabled:opacity-40" disabled={!permissions.canPanic}>PANIC</button>
       </Card>
     </div>
   );
 }
 
-function ToolsView({ profile, checkpoints }: { profile: UserProfile; checkpoints: Checkpoint[] }) {
+function ToolsView({
+  profile,
+  checkpoints,
+  branches,
+  online,
+  activeBranchId,
+  permissions
+}: {
+  profile: UserProfile;
+  checkpoints: Checkpoint[];
+  branches: Branch[];
+  online: boolean;
+  activeBranchId: string;
+  permissions: RolePermissions;
+}) {
   return (
     <div className="space-y-4">
-      {(profile.role === 'admin' || profile.role === 'owner') && <QrGenerator checkpoints={checkpoints} />}
-      <ExportPanel />
+      {permissions.canManageSystem && <BranchAdmin branches={branches} profile={profile} online={online} />}
+      {permissions.canManageSystem && <UserManagement profile={profile} activeBranchId={activeBranchId} />}
+      {permissions.canManageSystem && <QrGenerator checkpoints={checkpoints} />}
+      {permissions.canExport && <ExportPanel profile={profile} activeBranchId={activeBranchId} />}
       <AIAssistant />
     </div>
+  );
+}
+
+function BranchAdmin({ branches, profile, online }: { branches: Branch[]; profile: UserProfile; online: boolean }) {
+  const [name, setName] = useState('');
+  const createBranch = async () => {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    const payload = {
+      companyCode,
+      name: trimmed,
+      code: trimmed.toUpperCase().replace(/\s+/g, '-'),
+      active: true,
+      createdAt: new Date().toISOString(),
+      createdBy: profile.uid
+    };
+    try {
+      if (!online) throw new Error('offline');
+      await addDoc(collection(db, `${companyCode}_branches`), payload);
+      await addDoc(collection(db, 'auditLogs'), {
+        action: 'CREATE_BRANCH',
+        uid: profile.uid,
+        companyCode,
+        branchCode: payload.code,
+        createdAt: new Date().toISOString()
+      });
+      setName('');
+      toast.success('Branch created');
+    } catch {
+      await enqueue({ type: 'branch', payload, createdAt: new Date().toISOString() });
+      toast('Branch queued for sync.');
+    }
+  };
+  return (
+    <Card title="Branch Configuration">
+      <p className="text-xs text-white/80 mb-2">Active branches: {branches.map((b) => b.name).join(', ')}</p>
+      <input value={name} onChange={(e) => setName(e.target.value)} className="w-full p-3 rounded bg-black border border-white/20" placeholder="New branch name" />
+      <button onClick={createBranch} className="w-full mt-2 py-3 rounded text-black font-semibold" style={{ backgroundColor: branding.primary }}>Add Branch</button>
+    </Card>
+  );
+}
+
+function UserManagement({ profile, activeBranchId }: { profile: UserProfile; activeBranchId: string }) {
+  const [users, setUsers] = useState<UserProfile[]>([]);
+  useEffect(() => {
+    const constraints: any[] = [where('companyCode', '==', companyCode), limit(200)];
+    if (profile.role !== 'owner' && activeBranchId !== 'ALL') {
+      constraints.push(where('branchId', '==', activeBranchId));
+    }
+    const unsub = onSnapshot(query(collection(db, 'users'), ...constraints), (snap) => {
+      setUsers(snap.docs.map((d) => d.data() as UserProfile));
+    });
+    return () => unsub();
+  }, [profile.role, activeBranchId]);
+
+  return (
+    <Card title="User Access Monitor">
+      <ul className="space-y-1 text-sm max-h-48 overflow-auto">
+        {users.map((u) => (
+          <li key={u.uid} className="border-b border-white/10 pb-1">{u.displayName} - {u.role} - {u.branchName}</li>
+        ))}
+      </ul>
+    </Card>
   );
 }
 
@@ -462,14 +806,14 @@ function QrGenerator({ checkpoints }: { checkpoints: Checkpoint[] }) {
   );
 }
 
-function ExportPanel() {
+function ExportPanel({ profile, activeBranchId }: { profile: UserProfile; activeBranchId: string }) {
   const exportCsv = async () => {
-    const q = query(collection(db, `${companyCode}_attendance`), orderBy('createdAt', 'desc'), limit(500));
-    const rows: string[] = ['guardUid,guardName,mode,lat,lng,createdAt'];
+    const q = scopedQuery(`${companyCode}_attendance`, profile, activeBranchId, [orderBy('createdAt', 'desc'), limit(1000)]);
+    const rows: string[] = ['guardUid,guardName,branchId,mode,lat,lng,createdAt'];
     const unsub = onSnapshot(q, (snap) => {
       snap.docs.forEach((d) => {
         const x = d.data();
-        rows.push(`${x.guardUid},${x.guardName},${x.mode},${x.gps?.lat ?? ''},${x.gps?.lng ?? ''},${x.createdAt}`);
+        rows.push(`${x.guardUid},${x.guardName},${x.branchId ?? ''},${x.mode},${x.gps?.lat ?? ''},${x.gps?.lng ?? ''},${x.createdAt}`);
       });
       const blob = new Blob([rows.join('\n')], { type: 'text/csv;charset=utf-8;' });
       const url = URL.createObjectURL(blob);
@@ -551,12 +895,25 @@ function Card({ title, children }: { title: string; children: React.ReactNode })
   );
 }
 
+function ReadOnlyNotice({ text }: { text: string }) {
+  return <div className="rounded-xl border border-yellow-400/40 bg-yellow-500/10 px-3 py-2 text-sm text-yellow-100">{text}</div>;
+}
+
 function categorizeIncident(type: string, description: string) {
   const text = `${type} ${description}`.toLowerCase();
   if (text.includes('fire')) return 'Fire Risk';
   if (text.includes('weapon') || text.includes('armed')) return 'Violent Threat';
   if (text.includes('medical')) return 'Medical Emergency';
   return 'General Security';
+}
+
+function scopedQuery(path: string, profile: UserProfile, activeBranchId: string, constraints: any[]) {
+  const scoped = [...constraints];
+  const branch = profile.role === 'owner' ? activeBranchId : profile.branchId;
+  if (branch !== 'ALL') {
+    scoped.unshift(where('branchId', '==', branch));
+  }
+  return query(collection(db, path), ...scoped);
 }
 
 async function getGps() {
@@ -579,6 +936,7 @@ async function submitWithOffline(type: 'attendance' | 'incident' | 'patrol' | 'p
     await addDoc(collection(db, `${companyCode}_${type}`), payload);
     await addDoc(collection(db, `${companyCode}_activity`), {
       type,
+      branchId: payload.branchId,
       summary: `${type.toUpperCase()} by ${String(payload.guardUid || 'system')}`,
       createdAt: new Date().toISOString()
     });
@@ -586,11 +944,21 @@ async function submitWithOffline(type: 'attendance' | 'incident' | 'patrol' | 'p
       action: `WRITE_${type.toUpperCase()}`,
       uid: String(payload.guardUid || 'system'),
       companyCode,
+      branchId: String(payload.branchId || ''),
       createdAt: new Date().toISOString()
     });
   } catch {
     await enqueue({ type, payload: { ...payload, companyCode }, createdAt: new Date().toISOString() });
-    await enqueue({ type: 'audit', payload: { action: `QUEUE_${type.toUpperCase()}`, companyCode, createdAt: new Date().toISOString() }, createdAt: new Date().toISOString() });
+    await enqueue({
+      type: 'audit',
+      payload: {
+        action: `QUEUE_${type.toUpperCase()}`,
+        companyCode,
+        branchId: String(payload.branchId || ''),
+        createdAt: new Date().toISOString()
+      },
+      createdAt: new Date().toISOString()
+    });
   }
 }
 

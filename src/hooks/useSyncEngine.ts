@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { addDoc, collection } from 'firebase/firestore';
+import { addDoc, collection, doc, setDoc } from 'firebase/firestore';
 import { db } from '../lib/firebase';
 import { deleteQueuedAction, getQueuedActions } from '../lib/offlineQueue';
 import { useOnlineStatus } from './useOnlineStatus';
@@ -14,7 +14,16 @@ export function useSyncEngine() {
       const items = await getQueuedActions();
       for (const item of items) {
         try {
-          await addDoc(collection(db, `${String(item.payload.companyCode || 'DRS')}_${item.type}`), item.payload);
+          const companyCode = String(item.payload.companyCode || 'DRS');
+          if (item.type === 'profile') {
+            const uid = String(item.payload.uid || '');
+            if (!uid) continue;
+            await setDoc(doc(db, 'users', uid), item.payload, { merge: true });
+          } else if (item.type === 'branch') {
+            await addDoc(collection(db, `${companyCode}_branches`), item.payload);
+          } else {
+            await addDoc(collection(db, `${companyCode}_${item.type}`), item.payload);
+          }
           if (item.id) {
             await deleteQueuedAction(item.id);
           }

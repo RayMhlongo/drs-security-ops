@@ -1,76 +1,69 @@
 # DRS Security Ops
 
-Production-ready PWA + Capacitor Android operations app for DRS Data Response Security (South Africa).
+Production-ready Android-first PWA + Capacitor app for DRS guard operations.
 
-## Features
-- Google authentication + first-login role selection (`owner`, `management`, `admin`, `guard`)
-- Guard dashboard, patrol QR check-ins, incident reporting with photo evidence
-- Attendance clock-in/out with Google Sheets webhook sync
-- Emergency panic button with immediate command-center feed
-- Offline-first queue (IndexedDB) with auto-sync when connectivity returns
-- Firebase Storage photo uploads, Firestore audit logs, role-aware access controls
-- Google Maps visualization for patrol checkpoints
-- AI assistant module for report guidance and patrol priority suggestions
-- PWA installable on Android + Capacitor Android build support
+## New Final Update: First Login Role + Branch Workflow
+- On first Google login, user must select role (`Security Guard`, `Admin`, `Management`, `Owner`).
+- Non-owner users must select a branch.
+- Owner is automatically assigned `All Branches`.
+- Selection is persisted to:
+  - Firebase `users` document
+  - IndexedDB local cache (`profile` store)
+- If offline during first login, profile is queued and auto-synced when online.
 
-## Stack
-- React + Vite + TypeScript
-- TailwindCSS
-- Firebase (Auth, Firestore, Storage)
-- IndexedDB (`idb`)
-- Google Maps JavaScript API
-- QR code generator (`qrcode`)
+## Role-Based Access Control
+- `Security Guard`: patrol, incident, attendance, panic field actions.
+- `Admin`: branch configuration, user monitoring, QR/admin tools, exports.
+- `Management`: monitoring dashboards and exports (read-only field modules).
+- `Owner`: full access with branch scope selector.
 
-## Local Setup
-1. Install dependencies:
-   - `npm install`
-2. Create `.env` from `.env.example` and fill values.
-3. Run locally:
-   - `npm run dev`
-4. Production build:
-   - `npm run build`
+## Branch-Aware Operations
+All modules are branch-scoped and write branch metadata:
+- Patrol (`DRS_patrol`)
+- Incidents (`DRS_incident`)
+- Attendance (`DRS_attendance`)
+- Panic (`DRS_panic`)
+- Activity feed (`DRS_activity`)
+
+## Core Features (retained)
+- Offline IndexedDB queue + background sync
+- Google Maps checkpoint map
+- QR generator for checkpoint/employee/equipment IDs
+- Incident photo upload to Firebase Storage
+- Attendance webhook to Google Sheets
+- CSV export
+- AI assistant module
+- Audit logging
+
+## Mobile Display/UX Hardening
+- Safe-area support (`viewport-fit=cover`, `env(safe-area-inset-bottom)`)
+- Consistent system font stack (no first-load font anomalies)
+- Large touch targets for low-end Android devices
+
+## Setup
+1. `npm install`
+2. Copy `.env.example` to `.env`
+3. Fill Firebase + Maps + Sheets values
+4. `npm run dev`
+5. `npm run build`
 
 ## Firebase Setup
-1. Create Firebase project (Spark free tier).
-2. Enable Google Authentication.
-3. Create Firestore database (production mode).
-4. Create Storage bucket.
-5. Deploy rules/indexes:
+1. Enable Google Auth
+2. Create Firestore + Storage
+3. Deploy rules/indexes:
    - `firebase deploy --only firestore:rules,firestore:indexes`
-6. Deploy hosting:
+4. Deploy hosting:
    - `firebase deploy --only hosting`
 
-## Firestore Collections
-- `users`
-- `DRS_attendance`
-- `DRS_patrol`
-- `DRS_incident`
-- `DRS_panic`
-- `DRS_activity`
-- `DRS_checkpoints`
-- `auditLogs`
+## Android APK Build
+1. `npm run build`
+2. `npm run android:sync`
+3. `npm run android:open`
+4. Build signed APK from Android Studio
 
-## Google Sheets Integration
-- Configure `VITE_SHEETS_WEBHOOK_URL` with a Google Apps Script Web App endpoint.
-- Attendance events are sent in JSON payload format.
+## Stress Test
+- Run `npm run stress:test`
+- Simulates high-volume in-memory operational aggregation for hundreds of guards.
 
-## Android Build (Capacitor)
-1. Build web app:
-   - `npm run build`
-2. Initialize Android project (first time):
-   - `npx cap add android`
-3. Sync web assets:
-   - `npm run android:sync`
-4. Open Android Studio:
-   - `npm run android:open`
-5. Build signed APK in Android Studio (`Build > Generate Signed Bundle / APK`).
-
-## GitHub Deployment
-1. Push repo to `https://github.com/RayMhlongo/drs-security-ops`.
-2. Add repository secrets/environment for Firebase CLI if using CI deployment.
-3. Deploy from local or GitHub Action.
-
-## Security Notes
-- Enforce least-privilege roles via `firestore.rules`.
-- Restrict API keys by app and domain in Google Cloud Console.
-- Store no secrets in client repository.
+## GitHub
+- https://github.com/RayMhlongo/drs-security-ops

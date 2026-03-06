@@ -36,9 +36,6 @@ jobs:
       - name: Build web app
         run: npm run build
 
-      - name: Copy Capacitor web assets
-        run: npx cap copy android
-
       - name: Build debug APK
         working-directory: android
         run: ./gradlew assembleDebug

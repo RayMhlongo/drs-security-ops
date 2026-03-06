@@ -3,7 +3,9 @@ import type { FormEvent } from 'react';
 import { Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
 import {
   GoogleAuthProvider,
+  getRedirectResult,
   onAuthStateChanged,
+  signInWithRedirect,
   signInWithPopup,
   signOut
 } from 'firebase/auth';
@@ -111,6 +113,12 @@ function App() {
   }
 
   useEffect(() => {
+    getRedirectResult(auth).catch(() => {
+      // popup/redirect fallback path; no-op on first launch.
+    });
+  }, []);
+
+  useEffect(() => {
     return onAuthStateChanged(auth, async (authUser) => {
       setUser(authUser);
       if (!authUser) {
@@ -157,8 +165,12 @@ function LoginScreen({ online }: { online: boolean }) {
     try {
       await signInWithPopup(auth, new GoogleAuthProvider());
     } catch (error) {
-      toast.error('Google sign-in failed.');
-      console.error(error);
+      try {
+        await signInWithRedirect(auth, new GoogleAuthProvider());
+      } catch (redirectError) {
+        toast.error('Google sign-in failed.');
+        console.error(error, redirectError);
+      }
     }
   };
 

@@ -61,6 +61,17 @@ All modules are branch-scoped and write branch metadata:
 3. `npm run android:open`
 4. Build signed APK from Android Studio
 
+## GitHub APK Action Secrets
+Set these repository secrets so release APKs are fully configured:
+- `VITE_FIREBASE_API_KEY`
+- `VITE_FIREBASE_AUTH_DOMAIN`
+- `VITE_FIREBASE_PROJECT_ID`
+- `VITE_FIREBASE_STORAGE_BUCKET`
+- `VITE_FIREBASE_MESSAGING_SENDER_ID`
+- `VITE_FIREBASE_APP_ID`
+- `VITE_GOOGLE_MAPS_API_KEY`
+- `VITE_SHEETS_WEBHOOK_URL`
+
 ## Stress Test
 - Run `npm run stress:test`
 - Simulates high-volume in-memory operational aggregation for hundreds of guards.

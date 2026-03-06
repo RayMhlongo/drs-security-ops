@@ -25,7 +25,7 @@ import { getDownloadURL, ref, uploadString } from 'firebase/storage';
 import QRCode from 'qrcode';
 import toast, { Toaster } from 'react-hot-toast';
 import { format } from 'date-fns';
-import { auth, db, storage } from './lib/firebase';
+import { auth, db, isFirebaseConfigured, storage } from './lib/firebase';
 import { cacheBranches, cacheProfile, clearCachedProfile, enqueue, getCachedBranches, getCachedProfile } from './lib/offlineQueue';
 import { useSyncEngine } from './hooks/useSyncEngine';
 import type { Branch, Role, UserProfile } from './types/models';
@@ -105,6 +105,10 @@ function App() {
   const [user, setUser] = useState<User | null>(null);
   const [profile, setProfile] = useState<UserProfile | null>(null);
   const [loading, setLoading] = useState(true);
+
+  if (!isFirebaseConfigured) {
+    return <ConfigMissingScreen />;
+  }
 
   useEffect(() => {
     return onAuthStateChanged(auth, async (authUser) => {
@@ -688,6 +692,22 @@ function PanicView({
       <Card title="Emergency Panic Button">
         <button onClick={trigger} className="w-full py-14 rounded-2xl bg-red-600 text-2xl font-black disabled:opacity-40" disabled={!permissions.canPanic}>PANIC</button>
       </Card>
+    </div>
+  );
+}
+
+function ConfigMissingScreen() {
+  return (
+    <div className="min-h-[100dvh] p-6 grid place-items-center text-white">
+      <div className="w-full max-w-xl rounded-2xl border border-red-500/40 bg-black/70 p-6 space-y-3">
+        <h1 className="text-xl font-semibold">Configuration Required</h1>
+        <p className="text-sm text-white/80">
+          Firebase environment values are missing in this build. Add Vite Firebase variables, rebuild, and reinstall the APK.
+        </p>
+        <p className="text-xs text-white/60">
+          Required: `VITE_FIREBASE_API_KEY`, `VITE_FIREBASE_AUTH_DOMAIN`, `VITE_FIREBASE_PROJECT_ID`, `VITE_FIREBASE_STORAGE_BUCKET`, `VITE_FIREBASE_MESSAGING_SENDER_ID`, `VITE_FIREBASE_APP_ID`.
+        </p>
+      </div>
     </div>
   );
 }

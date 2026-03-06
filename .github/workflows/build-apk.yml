@@ -39,6 +39,11 @@ jobs:
       - name: Configure Android SDK path
         run: echo "sdk.dir=/usr/local/lib/android/sdk" > android/local.properties
 
+      - name: Install Android SDK packages
+        run: |
+          yes | sdkmanager --licenses
+          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+
       - name: Ensure Gradle executable
         run: chmod +x android/gradlew
 

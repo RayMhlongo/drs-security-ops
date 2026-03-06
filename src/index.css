@@ -1,0 +1,19 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+  color: #fff;
+  background: #000;
+}
+
+body {
+  margin: 0;
+  background: radial-gradient(circle at top, #2b2b2b 0%, #070707 40%, #000 100%);
+  min-height: 100vh;
+}
+
+button {
+  touch-action: manipulation;
+}

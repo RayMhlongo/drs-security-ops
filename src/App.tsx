@@ -23,6 +23,7 @@ import {
   limit,
   where
 } from 'firebase/firestore';
+import type { QueryConstraint } from 'firebase/firestore';
 import { getDownloadURL, ref, uploadString } from 'firebase/storage';
 import QRCode from 'qrcode';
 import toast, { Toaster } from 'react-hot-toast';
@@ -42,6 +43,25 @@ const branding = {
 type Checkpoint = { id: string; name: string; lat: number; lng: number };
 
 type Activity = { id: string; type: string; createdAt: string; summary: string };
+
+type GoogleMapsApi = {
+  maps: {
+    Map: new (
+      element: HTMLElement,
+      options: {
+        center: { lat: number; lng: number };
+        zoom: number;
+        mapTypeControl?: boolean;
+        streetViewControl?: boolean;
+      }
+    ) => unknown;
+    Marker: new (options: {
+      map: unknown;
+      position: { lat: number; lng: number };
+      title: string;
+    }) => unknown;
+  };
+};
 
 type RolePermissions = {
   canPatrol: boolean;
@@ -107,10 +127,7 @@ function App() {
   const [user, setUser] = useState<User | null>(null);
   const [profile, setProfile] = useState<UserProfile | null>(null);
   const [loading, setLoading] = useState(true);
-
-  if (!isFirebaseConfigured) {
-    return <ConfigMissingScreen />;
-  }
+  const cachedProfileUidRef = useRef<string | null>(null);
 
   useEffect(() => {
     getRedirectResult(auth).catch(() => {
@@ -122,13 +139,15 @@ function App() {
     return onAuthStateChanged(auth, async (authUser) => {
       setUser(authUser);
       if (!authUser) {
-        if (user?.uid) {
-          await clearCachedProfile(user.uid);
+        if (cachedProfileUidRef.current) {
+          await clearCachedProfile(cachedProfileUidRef.current);
+          cachedProfileUidRef.current = null;
         }
         setProfile(null);
         setLoading(false);
         return;
       }
+      cachedProfileUidRef.current = authUser.uid;
       try {
         const profileSnap = await getDoc(doc(db, 'users', authUser.uid));
         if (profileSnap.exists()) {
@@ -144,6 +163,10 @@ function App() {
       setLoading(false);
     });
   }, []);
+
+  if (!isFirebaseConfigured) {
+    return <ConfigMissingScreen />;
+  }
 
   if (loading) {
     return <div className="min-h-screen grid place-items-center text-white">Loading...</div>;
@@ -792,7 +815,7 @@ function BranchAdmin({ branches, profile, online }: { branches: Branch[]; profil
 function UserManagement({ profile, activeBranchId }: { profile: UserProfile; activeBranchId: string }) {
   const [users, setUsers] = useState<UserProfile[]>([]);
   useEffect(() => {
-    const constraints: any[] = [where('companyCode', '==', companyCode), limit(200)];
+    const constraints: QueryConstraint[] = [where('companyCode', '==', companyCode), limit(200)];
     if (profile.role !== 'owner' && activeBranchId !== 'ALL') {
       constraints.push(where('branchId', '==', activeBranchId));
     }
@@ -939,7 +962,7 @@ function categorizeIncident(type: string, description: string) {
   return 'General Security';
 }
 
-function scopedQuery(path: string, profile: UserProfile, activeBranchId: string, constraints: any[]) {
+function scopedQuery(path: string, profile: UserProfile, activeBranchId: string, constraints: QueryConstraint[]) {
   const scoped = [...constraints];
   const branch = profile.role === 'owner' ? activeBranchId : profile.branchId;
   if (branch !== 'ALL') {
@@ -1012,7 +1035,7 @@ async function postToSheet(payload: Record<string, unknown>) {
 async function loadGoogleMaps() {
   if (window.google?.maps) return;
   await new Promise<void>((resolve, reject) => {
-    const existing = document.querySelector<HTMLScriptElement>('script[data-google-maps=\"1\"]');
+    const existing = document.querySelector<HTMLScriptElement>('script[data-google-maps="1"]');
     if (existing) {
       existing.addEventListener('load', () => resolve(), { once: true });
       existing.addEventListener('error', () => reject(new Error('Google Maps failed to load')), { once: true });
@@ -1032,6 +1055,6 @@ async function loadGoogleMaps() {
 export default App;
 declare global {
   interface Window {
-    google?: any;
+    google?: GoogleMapsApi;
   }
 }
